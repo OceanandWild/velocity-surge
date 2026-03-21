@@ -12088,7 +12088,7 @@
         if (window.__velocitySurgeCorePatchApplied) return;
         window.__velocitySurgeCorePatchApplied = true;
 
-        const SAVE_SCHEMA_VERSION = 4;
+        const SAVE_SCHEMA_VERSION = 5;
         const PRIMARY_SAVE_KEY = 'velocity_surge_save';
         const BACKUP_SAVE_KEY = 'velocity_surge_save_backup';
         const ELEMENTAL_EVENT_ID = 'elemental_convergence';
@@ -12277,7 +12277,7 @@
                 projectile: { name: 'Onda de Réplica', effect: 'replica_wave' },
                 turbo: { name: 'Sobremarcha Réplica', boost: 2.2, effect: 'replica_overdrive' },
                 trap: { name: 'Clon Aterrador', effect: 'replica_clone', duration: 5.8 },
-                unlocked: true, price: 0
+                unlocked: false, price: 5200
             },
             umbra_reaper: {
                 name: 'UMBRA REAPER', rarity: 'mythic', color: '#5e35b1', secondaryColor: '#ff4fa3',
@@ -12286,7 +12286,7 @@
                 projectile: { name: 'Aguja Umbral', effect: 'umbra_spike' },
                 turbo: { name: 'Fase Abisal', boost: 2.28, effect: 'umbra_phase' },
                 trap: { name: 'Totem de Sombra', effect: 'umbra_totem', duration: 5.5 },
-                unlocked: true, price: 0
+                unlocked: false, price: 10000
             }
         };
 
@@ -12305,6 +12305,7 @@
             const data = { ...rawData };
             const ensureArray = (v) => Array.isArray(v) ? v : [];
             const ensureChestInventory = (v) => (v && typeof v === 'object') ? v : {};
+            const releaseLockedCharacters = new Set(['replica', 'umbra_reaper', 'elemental_aqua', 'elemental_thunder']);
 
             data.saveVersion = Number(data.saveVersion || 0);
             data.unlockedCharacters = ensureArray(data.unlockedCharacters);
@@ -12318,8 +12319,10 @@
             if (!CHARACTERS[data.selectedCharacter]) data.selectedCharacter = 'blaze';
             if (!MAPS[data.selectedMap]) data.selectedMap = 'neon_city';
             if (!data.unlockedCharacters.includes('blaze')) data.unlockedCharacters.unshift('blaze');
-            if (!data.unlockedCharacters.includes('replica')) data.unlockedCharacters.push('replica');
-            if (!data.unlockedCharacters.includes('umbra_reaper')) data.unlockedCharacters.push('umbra_reaper');
+            if (data.saveVersion < SAVE_SCHEMA_VERSION) {
+                data.unlockedCharacters = data.unlockedCharacters.filter(id => !releaseLockedCharacters.has(id));
+                if (releaseLockedCharacters.has(data.selectedCharacter)) data.selectedCharacter = 'blaze';
+            }
             if (!data.characterLevels.blaze) data.characterLevels.blaze = 1;
             if (!data.characterLevels.replica) data.characterLevels.replica = 1;
             if (!data.characterLevels.umbra_reaper) data.characterLevels.umbra_reaper = 1;
