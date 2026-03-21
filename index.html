@@ -4317,35 +4317,54 @@
             });
         }
 
-        function purchaseEventOffer(offer) {
-            if (GameData.voltBits < offer.price) { alert('No tienes suficientes VoltBits!'); return; }
+        async function purchaseEventOffer(offer) {
             if (!GameData.purchasedOffers) GameData.purchasedOffers = [];
             if (GameData.purchasedOffers.includes(offer.id)) { alert('Ya compraste esta oferta.'); return; }
 
-            startOceanPayTransaction(offer.price, `Oferta: ${offer.name}`, () => {
-                let selectedCharId = offer.gives.character;
-                if (Array.isArray(offer.pool) && offer.pool.length > 0) {
-                    const validPool = offer.pool.filter(id => CHARACTERS[id]);
-                    if (validPool.length > 0) {
-                        const preferred = validPool.includes(GameData.eventTargetRacer) ? GameData.eventTargetRacer : null;
-                        selectedCharId = preferred || validPool[Math.floor(Math.random() * validPool.length)];
+            if (offer?.remoteOffer) {
+                if (!oceanPayState?.token || oceanPayState?.linked !== true) {
+                    alert('Conecta Ocean Pay para comprar ofertas sincronizadas.');
+                    return;
+                }
+                if (!confirm(`¿Confirmar compra de ${offer.name} por ${offer.price} VoltBits?`)) return;
+                try {
+                    const res = await fetchWithTimeoutAndRetry(
+                        `https://owsdatabase.onrender.com/project-commerce/${encodeURIComponent(String(offer.remoteOfferProject || VS_PROJECT_SLUG))}/offers/${encodeURIComponent(String(offer.remoteOfferCode || ''))}/purchase`,
+                        {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Authorization': `Bearer ${oceanPayState.token}`
+                            },
+                            body: JSON.stringify({ surface: 'project' })
+                        },
+                        1,
+                        15000
+                    );
+                    const data = await res.json().catch(() => ({}));
+                    if (res.status === 401 || res.status === 403) {
+                        clearOceanPaySession(true);
+                        updateOceanPayUI();
+                        return;
                     }
+                    if (!res.ok || !data?.success) {
+                        alert(data?.error || `No se pudo comprar la oferta (${res.status})`);
+                        return;
+                    }
+                    const newBalance = Math.max(0, Math.floor(Number(data?.balance?.amount || 0)));
+                    GameData.voltBits = newBalance;
+                    applyOfferRewardsToGame(offer);
+                    showNotification('Oferta sincronizada comprada correctamente.');
+                } catch (_) {
+                    alert(navigator.onLine ? 'Error de conexion al comprar la oferta sincronizada.' : 'Sin conexion a internet.');
                 }
+                return;
+            }
 
+            if (GameData.voltBits < offer.price) { alert('No tienes suficientes VoltBits!'); return; }
+            startOceanPayTransaction(offer.price, `Oferta: ${offer.name}`, () => {
                 GameData.voltBits -= offer.price;
-                GameData.purchasedOffers.push(offer.id);
-                if (selectedCharId && !GameData.unlockedCharacters.includes(selectedCharId)) GameData.unlockedCharacters.push(selectedCharId);
-                if (offer.gives.cards && selectedCharId) GameData.characterCards[selectedCharId] = (GameData.characterCards[selectedCharId] || 0) + offer.gives.cards;
-                if (offer.gives.bits) grantVoltBits(offer.gives.bits, false, `Oferta: ${offer.name}`);
-                updateVoltBitsDisplay(); saveGame();
-                if (offer.chestType) {
-                    awardChest(offer.chestType, false, { txt: offer.name, rewardCards: offer.gives.cards, rarity: 'legendary' });
-                } else {
-                    showNotification((CHARACTERS[selectedCharId]?.name || 'CORREDOR') + ' DESBLOQUEADO! +' + (offer.gives.cards || 0) + ' tarjetas');
-                }
-                const curEvt = EVENTS_CALENDAR.find(e => { const n = new Date(); return n >= e.startDate && n <= e.endDate; });
-                if (curEvt) _renderEventOffers(curEvt, new Date());
-                renderShopEventOffers();
+                applyOfferRewardsToGame(offer);
             });
         }
 
@@ -12525,6 +12544,7 @@
         };
 
         window.__VS_REBUILD_EVENTS();
+        syncRemoteProjectOffers(true);
 
         window.__VS_GET_CURRENT_EVENT = function getCurrentEvent(now = new Date()) {
             return EVENTS_CALENDAR.find(e => now >= e.startDate && now <= e.endDate) || null;
@@ -12641,6 +12661,11 @@
         const baseShowShop = showShop;
         showShop = function showShopPatched() {
             baseShowShop();
+            syncRemoteProjectOffers(true).then(() => {
+                try {
+                    renderShopEventOffers();
+                } catch (_) { }
+            });
             try {
                 if (window.__VS_SHOP_CD_INTERVAL) {
                     clearInterval(window.__VS_SHOP_CD_INTERVAL);
@@ -12711,6 +12736,146 @@
                 }
             }
             throw lastErr || new Error('Network error');
+        }
+
+        const VS_PROJECT_SLUG = 'velocity-surge';
+        const VS_REMOTE_SYNC_CACHE = {
+            offers: [],
+            fetchedAt: 0,
+            loading: false
+        };
+
+        function mapRemoteOfferToEventOffer(remote) {
+            const reward = (remote?.rewardPayload && typeof remote.rewardPayload === 'object')
+                ? remote.rewardPayload
+                : {};
+            const evt = (reward?.event_offer && typeof reward.event_offer === 'object')
+                ? reward.event_offer
+                : null;
+            if (!evt || !evt.id) return null;
+            return {
+                ...evt,
+                price: Math.max(0, Math.floor(Number(remote?.surfacePrice ?? remote?.basePrice ?? evt.price ?? 0))),
+                originalPrice: Number(remote?.hasStoreExclusiveDiscount)
+                    ? Math.max(0, Math.floor(Number(remote?.basePrice || 0)))
+                    : 0,
+                remoteOffer: true,
+                remoteOfferCode: String(remote?.offerCode || ''),
+                remoteOfferProject: String(remote?.projectSlug || VS_PROJECT_SLUG),
+                remoteOfferCurrency: String(remote?.currency || 'voltbit').toLowerCase()
+            };
+        }
+
+        function applyRemoteOffersIntoEvents(remoteOffers) {
+            Object.keys(EVENT_OFFERS).forEach((evtKey) => {
+                EVENT_OFFERS[evtKey] = (Array.isArray(EVENT_OFFERS[evtKey]) ? EVENT_OFFERS[evtKey] : []).filter(o => !o?.remoteOffer);
+            });
+            (Array.isArray(remoteOffers) ? remoteOffers : []).forEach((remote) => {
+                const mapped = mapRemoteOfferToEventOffer(remote);
+                if (!mapped) return;
+                const eventId = String(mapped.eventId || '').trim().toLowerCase();
+                if (!eventId || !EVENT_OFFERS[eventId]) return;
+                EVENT_OFFERS[eventId].push(mapped);
+            });
+        }
+
+        async function syncRemoteProjectOffers(force = false) {
+            const now = Date.now();
+            if (!force && VS_REMOTE_SYNC_CACHE.loading) return;
+            if (!force && VS_REMOTE_SYNC_CACHE.fetchedAt > 0 && (now - VS_REMOTE_SYNC_CACHE.fetchedAt) < 45000) return;
+            VS_REMOTE_SYNC_CACHE.loading = true;
+            try {
+                const res = await fetchWithTimeoutAndRetry(`https://owsdatabase.onrender.com/project-commerce/${encodeURIComponent(VS_PROJECT_SLUG)}/offers?surface=project`, {
+                    method: 'GET'
+                }, 1, 12000);
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok || !data?.success || !Array.isArray(data?.offers)) return;
+                VS_REMOTE_SYNC_CACHE.offers = data.offers;
+                VS_REMOTE_SYNC_CACHE.fetchedAt = Date.now();
+                applyRemoteOffersIntoEvents(VS_REMOTE_SYNC_CACHE.offers);
+            } catch (_) {
+                // Ignore network hiccups. Local offers remain usable.
+            } finally {
+                VS_REMOTE_SYNC_CACHE.loading = false;
+            }
+        }
+
+        async function syncProjectCommerceClaims() {
+            if (!oceanPayState?.token || oceanPayState?.linked !== true) return;
+            try {
+                const res = await fetchWithTimeoutAndRetry(
+                    `https://owsdatabase.onrender.com/project-commerce/${encodeURIComponent(VS_PROJECT_SLUG)}/purchases/claim`,
+                    {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${oceanPayState.token}`
+                        },
+                        body: JSON.stringify({})
+                    },
+                    1,
+                    15000
+                );
+                const data = await res.json().catch(() => ({}));
+                if (res.status === 401 || res.status === 403) {
+                    clearOceanPaySession(true);
+                    updateOceanPayUI();
+                    return;
+                }
+                const claimed = Array.isArray(data?.claimed) ? data.claimed : [];
+                if (!res.ok || !data?.success || claimed.length === 0) return;
+
+                if (!GameData.purchasedOffers) GameData.purchasedOffers = [];
+                let applied = 0;
+                claimed.forEach((entry) => {
+                    const reward = (entry?.rewardPayload && typeof entry.rewardPayload === 'object') ? entry.rewardPayload : {};
+                    const evtOffer = (reward?.event_offer && typeof reward.event_offer === 'object') ? reward.event_offer : null;
+                    if (!evtOffer || !evtOffer.id) return;
+                    if (GameData.purchasedOffers.includes(evtOffer.id)) return;
+                    const offer = {
+                        ...evtOffer,
+                        price: 0,
+                        remoteOffer: true,
+                        remoteOfferCode: String(entry?.offerCode || ''),
+                        remoteOfferProject: VS_PROJECT_SLUG,
+                        remoteOfferCurrency: String(entry?.currency || 'voltbit').toLowerCase()
+                    };
+                    applyOfferRewardsToGame(offer);
+                    applied += 1;
+                });
+                if (applied > 0) {
+                    showNotification(`Sincronizadas ${applied} oferta(s) compradas desde OWS Store.`);
+                }
+            } catch (_) {
+                // Silent on sync failures.
+            }
+        }
+
+        function applyOfferRewardsToGame(offer) {
+            let selectedCharId = offer.gives.character;
+            if (Array.isArray(offer.pool) && offer.pool.length > 0) {
+                const validPool = offer.pool.filter(id => CHARACTERS[id]);
+                if (validPool.length > 0) {
+                    const preferred = validPool.includes(GameData.eventTargetRacer) ? GameData.eventTargetRacer : null;
+                    selectedCharId = preferred || validPool[Math.floor(Math.random() * validPool.length)];
+                }
+            }
+
+            if (!GameData.purchasedOffers) GameData.purchasedOffers = [];
+            GameData.purchasedOffers.push(offer.id);
+            if (selectedCharId && !GameData.unlockedCharacters.includes(selectedCharId)) GameData.unlockedCharacters.push(selectedCharId);
+            if (offer.gives.cards && selectedCharId) GameData.characterCards[selectedCharId] = (GameData.characterCards[selectedCharId] || 0) + offer.gives.cards;
+            if (offer.gives.bits) grantVoltBits(offer.gives.bits, false, `Oferta: ${offer.name}`);
+            updateVoltBitsDisplay();
+            saveGame();
+            if (offer.chestType) {
+                awardChest(offer.chestType, false, { txt: offer.name, rewardCards: offer.gives.cards, rarity: 'legendary' });
+            } else {
+                showNotification((CHARACTERS[selectedCharId]?.name || 'CORREDOR') + ' DESBLOQUEADO! +' + (offer.gives.cards || 0) + ' tarjetas');
+            }
+            const curEvt = EVENTS_CALENDAR.find(e => { const n = new Date(); return n >= e.startDate && n <= e.endDate; });
+            if (curEvt) _renderEventOffers(curEvt, new Date());
+            renderShopEventOffers();
         }
 
         const VS_PENDING_VOLTBIT_KEY = 'velocity_surge_pending_voltbit_credits_v1';
@@ -12878,6 +13043,7 @@
                 localStorage.setItem('opLinked', '1');
 
                 await flushPendingVoltBitCredits({ silent: true });
+                await syncProjectCommerceClaims();
 
                 const primary = data.cards.find(c => c.is_primary) || data.cards[0];
                 const serverBalance = Math.floor(primary?.balances?.voltbit || 0);
@@ -12980,6 +13146,7 @@
                 oceanPayState.lastSyncAt = Date.now();
                 localStorage.setItem('opLinked', '1');
                 await flushPendingVoltBitCredits({ silent: true });
+                await syncProjectCommerceClaims();
                 cardList.innerHTML = '';
                 let pendingTotal = getPendingVoltBitCreditsTotal();
                 let hasPrimary = false;
